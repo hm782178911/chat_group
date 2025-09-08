@@ -279,17 +279,17 @@ func main() {
 
 	case "set-server":
 		if len(os.Args) < 3 {
-			color.Red("使用方法: chat set-server <服务器地址>")
+			fmt.Println("使用方法: chat set-server <服务器地址>")
 			os.Exit(1)
 		}
 		config.ServerURL = os.Args[2]
 		err = saveConfig(config)
 		if err == nil {
-			color.Green("✓ 服务器地址已设置为: %s", config.ServerURL)
+			fmt.Println("✓ 服务器地址已设置为: %s", config.ServerURL)
 		}
 
 	default:
-		color.Red("未知命令: %s", command)
+		fmt.Println("未知命令: %s", command)
 		os.Exit(1)
 	}
 }
