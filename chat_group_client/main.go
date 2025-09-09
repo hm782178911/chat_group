@@ -9,15 +9,23 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
+	"image/color"
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/canvas"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/widget"
 )
 
 // Config 配置文件结构
 type Config struct {
-	ServerURL   string `json:"server_url"`
-	Username    string `json:"username"`
+	ServerURL string `json:"server_url"`
+	Username  string `json:"username"`
 }
 
 // Message 消息结构
@@ -28,7 +36,7 @@ type Message struct {
 	Type      string    `json:"type"`
 }
 
-// loadConfig 加载配置文件
+// ---------------- 通用配置加载 ----------------
 func loadConfig() (*Config, error) {
 	file, err := os.Open("config.json")
 	if err != nil {
@@ -61,7 +69,7 @@ func saveConfig(config *Config) error {
 	return encoder.Encode(config)
 }
 
-// joinChat 加入聊天室
+// ---------------- CLI 模式（Linux/macOS） ----------------
 func joinChat(serverURL, username string) error {
 	data := url.Values{}
 	data.Set("username", username)
@@ -73,8 +81,6 @@ func joinChat(serverURL, username string) error {
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
-
-	// 检查HTTP状态码
 	if resp.StatusCode != http.StatusOK {
 		if resp.StatusCode == http.StatusConflict {
 			return fmt.Errorf("用户名 '%s' 已存在，请选择其他用户名", username)
@@ -93,36 +99,23 @@ func joinChat(serverURL, username string) error {
 	return nil
 }
 
-// leaveChat 离开聊天室
 func leaveChat(serverURL, username string) error {
 	data := url.Values{}
 	data.Set("username", username)
-
-	resp, err := http.PostForm(serverURL+"/leave", data)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
+	_, _ = http.PostForm(serverURL+"/leave", data)
 	return nil
 }
 
-// sendMessage 发送消息
 func sendMessage(serverURL, sender, content string) error {
 	data := url.Values{}
 	data.Set("sender", sender)
 	data.Set("content", content)
 
-	resp, err := http.PostForm(serverURL+"/send", data)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	return nil
+	_, err := http.PostForm(serverURL+"/send", data)
+	return err
 }
 
-// startRealTimeChat 启动实时群聊
 func startRealTimeChat(serverURL, username string) {
-	// 先加入聊天室
 	if err := joinChat(serverURL, username); err != nil {
 		fmt.Printf("❌ 加入失败: %v\n", err)
 		return
@@ -136,7 +129,6 @@ func startRealTimeChat(serverURL, username string) {
 	fmt.Println("❌ 输入 'exit' 退出聊天")
 	fmt.Println("🔔 开始接收消息...\n")
 
-	// 启动SSE连接
 	events := make(chan Message)
 	go func() {
 		resp, err := http.Get(serverURL + "/stream?user=" + url.QueryEscape(username))
@@ -153,7 +145,6 @@ func startRealTimeChat(serverURL, username string) {
 				fmt.Printf("❌ 连接断开: %v\n", err)
 				return
 			}
-
 			if strings.HasPrefix(line, "data: ") {
 				var msg Message
 				json.Unmarshal([]byte(line[6:]), &msg)
@@ -162,11 +153,9 @@ func startRealTimeChat(serverURL, username string) {
 		}
 	}()
 
-	// 处理信号
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// 处理输入
 	inputChan := make(chan string)
 	go func() {
 		scanner := bufio.NewScanner(os.Stdin)
@@ -192,45 +181,9 @@ func startRealTimeChat(serverURL, username string) {
 				fmt.Println("👋 退出聊天")
 				return
 			}
-
-			switch input {
-			case "/users":
-				resp, err := http.Get(serverURL + "/users")
-				if err == nil {
-					var result map[string]interface{}
-					json.NewDecoder(resp.Body).Decode(&result)
-					if users, ok := result["users"].([]interface{}); ok {
-						fmt.Println("👥 在线用户:")
-						for _, user := range users {
-							if u, ok := user.(map[string]interface{}); ok {
-								fmt.Printf("  • %s\n", u["name"])
-							}
-						}
-					}
-				}
-
-			case "/history":
-				resp, err := http.Get(serverURL + "/history?limit=10")
-				if err == nil {
-					var result map[string]interface{}
-					json.NewDecoder(resp.Body).Decode(&result)
-					if messages, ok := result["messages"].([]interface{}); ok {
-						fmt.Println("📜 最近消息:")
-						for _, msg := range messages {
-							if m, ok := msg.(map[string]interface{}); ok {
-								ts, _ := time.Parse(time.RFC3339, m["timestamp"].(string))
-								fmt.Printf("  [%s] %s: %s\n", 
-									ts.Format("15:04"), m["sender"].(string), m["content"].(string))
-							}
-						}
-					}
-				}
-
-			default:
-				if input != "" {
-					if err := sendMessage(serverURL, username, input); err != nil {
-						fmt.Printf("❌ 发送失败: %v\n", err)
-					}
+			if input != "" {
+				if err := sendMessage(serverURL, username, input); err != nil {
+					fmt.Printf("❌ 发送失败: %v\n", err)
 				}
 			}
 
@@ -241,6 +194,123 @@ func startRealTimeChat(serverURL, username string) {
 	}
 }
 
+// ---------------- Windows GUI 模式 ----------------
+
+// 辅助函数：添加带颜色的消息
+func addMessage(container *fyne.Container, text string, col color.Color) {
+	label := canvas.NewText(text, col)
+	label.TextStyle = fyne.TextStyle{}
+	container.Add(label)
+	container.Refresh()
+}
+
+func startGUIChat(serverURL, username string) {
+	a := app.New()
+	w := a.NewWindow("聊天室 - " + username)
+
+	// 聊天记录容器
+	chatVBox := container.NewVBox()
+	chatScroll := container.NewVScroll(chatVBox)
+	chatScroll.SetMinSize(fyne.NewSize(580, 350))
+
+	// 输入框
+	input := widget.NewEntry()
+	input.SetPlaceHolder("输入消息...")
+
+	// 发送按钮
+	sendBtn := widget.NewButton("发送", func() {
+		msg := strings.TrimSpace(input.Text)
+		if msg != "" {
+			if err := sendMessage(serverURL, username, msg); err != nil {
+				addMessage(chatVBox, fmt.Sprintf("❌ 发送失败: %v", err), color.RGBA{255, 0, 0, 255})
+			} else {
+				input.SetText("")
+			}
+		}
+	})
+
+	// 回车发送
+	input.OnSubmitted = func(text string) {
+		sendBtn.OnTapped()
+	}
+
+	// 底部输入栏
+	inputBar := container.NewBorder(nil, nil, nil, sendBtn, input)
+
+	w.SetContent(container.NewBorder(nil, inputBar, nil, nil, chatScroll))
+	w.Resize(fyne.NewSize(600, 500))
+
+	// 消息 channel
+	msgChan := make(chan Message, 50)
+
+	// 接收消息
+	go func() {
+		resp, err := http.Get(serverURL + "/stream?user=" + url.QueryEscape(username))
+		if err != nil {
+			msgChan <- Message{Sender: "系统", Content: fmt.Sprintf("❌ 连接失败: %v", err), Timestamp: time.Now(), Type: "system"}
+			close(msgChan)
+			return
+		}
+		defer resp.Body.Close()
+
+		reader := bufio.NewReader(resp.Body)
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				if err != io.EOF {
+					msgChan <- Message{Sender: "系统", Content: fmt.Sprintf("❌ 连接断开: %v", err), Timestamp: time.Now(), Type: "system"}
+				}
+				close(msgChan)
+				return
+			}
+			if strings.HasPrefix(line, "data: ") {
+				var msg Message
+				if err := json.Unmarshal([]byte(line[6:]), &msg); err == nil {
+					msgChan <- msg
+				}
+			}
+		}
+	}()
+
+	// 定时器在主线程更新 UI
+	ticker := time.NewTicker(100 * time.Millisecond)
+	go func() {
+		for range ticker.C {
+			select {
+			case msg, ok := <-msgChan:
+				if !ok {
+					ticker.Stop()
+					return
+				}
+				var textColor color.Color
+				var prefix string
+				switch msg.Type {
+				case "join":
+					textColor = color.RGBA{0, 128, 0, 255}
+					prefix = "👥 "
+				case "leave":
+					textColor = color.RGBA{128, 0, 0, 255}
+					prefix = "👋 "
+				case "system":
+					textColor = color.RGBA{255, 0, 0, 255}
+					prefix = "⚠️ "
+				default:
+					textColor = color.RGBA{0, 0, 0, 255}
+					prefix = "💬 "
+				}
+				display := fmt.Sprintf("[%s] %s%s: %s", msg.Timestamp.Format("15:04:05"), prefix, msg.Sender, msg.Content)
+				addMessage(chatVBox, display, textColor)
+			default:
+			}
+		}
+	}()
+
+	w.ShowAndRun()
+}
+
+
+
+// ---------------- 主入口 ----------------
 func main() {
 	config, err := loadConfig()
 	if err != nil {
@@ -248,24 +318,25 @@ func main() {
 		os.Exit(1)
 	}
 
-	// if len(os.Args) < 2 {
-	// 	fmt.Println("使用方法: chat start [用户名]")
-	// 	os.Exit(1)
-	// }
+	username := config.Username
+	if len(os.Args) >= 3 {
+		username = os.Args[2]
+		config.Username = username
+		saveConfig(config)
+	}
 
-	// if os.Args[1] == "start" {
-	// 	username := config.Username
-	// 	if len(os.Args) >= 3 {
-	// 		username = os.Args[2]
-	// 		config.Username = username
-	// 		saveConfig(config)
-	// 	}
-	// 	startRealTimeChat(config.ServerURL, username)
+	command :="start"
+	if len(os.Args) >= 2 {
+		command = os.Args[1]
+	}
+	
+	// 根据系统决定模式
+	// if runtime.GOOS == "windows" {
+	// 	startGUIChat(config.ServerURL, username)
 	// } else {
-	// 	fmt.Println("未知命令，使用: chat start [用户名]")
+	// 	startRealTimeChat(config.ServerURL, username)
 	// }
 
-	command := os.Args[1]
 
 	switch command {
 	case "start":
@@ -275,7 +346,12 @@ func main() {
 			config.Username = username
 			saveConfig(config)
 		}
-		startRealTimeChat(config.ServerURL, username)
+		// startRealTimeChat(config.ServerURL, username)
+		if runtime.GOOS == "windows" {
+			startGUIChat(config.ServerURL, username)
+		} else {
+			startRealTimeChat(config.ServerURL, username)
+		}
 
 	case "set-server":
 		if len(os.Args) < 3 {
