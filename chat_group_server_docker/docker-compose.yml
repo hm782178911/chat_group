@@ -1,0 +1,30 @@
+# version: '3.8'
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: chat-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./redis-data:/data
+    command: redis-server --appendonly yes --save 60 1 --save 300 10 --save 900 100
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  chat-server:
+    build: .
+    ports:
+      - "8080:8080"
+    depends_on:
+      - redis
+    environment:
+      - REDIS_HOST=redis:6379
+      - REDIS_ADDR=redis:6379
+    restart: unless-stopped
+
+volumes:
+  redis-data:

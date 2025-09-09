@@ -44,7 +44,7 @@ func NewChatServer() *ChatServer {
 	// 	clients:  make(map[chan Message]bool),
 	// }
 	// 初始化Redis存储
-	redisStore := redisstore.NewRedisStore("localhost:6379", "", 0)
+	redisStore := redisstore.NewRedisStore("redis:6379", "", 0)
 	
 	server := &ChatServer{
 		messages:   make([]Message, 0),
