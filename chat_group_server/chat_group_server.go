@@ -7,7 +7,9 @@ import (
 	"net/http"
 	"sync"
 	"time"
+	// "os"
 	// "strings"
+	"chat_group_server/redisstore"
 )
 
 // Message 结构体表示一条聊天消息
@@ -31,16 +33,99 @@ type ChatServer struct {
 	users         map[string]*User    // 在线用户
 	clients       map[chan Message]bool // 客户端连接通道
 	mutex         sync.RWMutex        // 保护共享数据的读写锁
+	redisStore    *redisstore.RedisStore // 添加 Redis 存储
 }
 
 // NewChatServer 创建新的聊天服务器实例
 func NewChatServer() *ChatServer {
-	return &ChatServer{
-		messages: make([]Message, 0),
-		users:    make(map[string]*User),
-		clients:  make(map[chan Message]bool),
+	// return &ChatServer{
+	// 	messages: make([]Message, 0),
+	// 	users:    make(map[string]*User),
+	// 	clients:  make(map[chan Message]bool),
+	// }
+	// 初始化Redis存储
+	redisStore := redisstore.NewRedisStore("localhost:6379", "", 0)
+	
+	server := &ChatServer{
+		messages:   make([]Message, 0),
+		users:      make(map[string]*User),
+		clients:    make(map[chan Message]bool),
+		redisStore: redisStore,
+	}
+	
+	// 从Redis加载历史数据
+	server.loadFromRedis()
+	
+	// 启动自动备份（可选）
+	go server.autoBackup()
+	
+	return server
+}
+
+// loadFromRedis 从Redis加载历史数据
+func (cs *ChatServer) loadFromRedis() {
+	cs.mutex.Lock()
+	defer cs.mutex.Unlock()
+
+	log.Println("从Redis加载历史数据...")
+	
+	// 加载消息
+	messages, err := cs.redisStore.GetRecentMessages(1000)
+	if err != nil {
+		log.Printf("加载消息失败: %v", err)
+	} else {
+		for _, msgMap := range messages {
+			timestampStr, ok := msgMap["timestamp"].(string)
+			if !ok {
+				continue
+			}
+			
+			timestamp, err := time.Parse(time.RFC3339, timestampStr)
+			if err != nil {
+				log.Printf("解析时间戳失败: %v", err)
+				continue
+			}
+			
+			cs.messages = append(cs.messages, Message{
+				Sender:    msgMap["sender"].(string),
+				Content:   msgMap["content"].(string),
+				Type:      msgMap["type"].(string),
+				Timestamp: timestamp,
+			})
+		}
+		log.Printf("从Redis加载了 %d 条消息", len(messages))
+	}
+	
+	// 加载用户
+	users, err := cs.redisStore.GetAllUsers()
+	if err != nil {
+		log.Printf("加载用户失败: %v", err)
+	} else {
+		for username, userMap := range users {
+			lastSeenStr, ok := userMap["last_seen"].(string)
+			if !ok {
+				continue
+			}
+			
+			lastSeen, err := time.Parse(time.RFC3339, lastSeenStr)
+			if err != nil {
+				log.Printf("解析最后在线时间失败: %v", err)
+				continue
+			}
+			
+			isOnline, _ := userMap["is_online"].(bool)
+			
+			cs.users[username] = &User{
+				Name:     username,
+				LastSeen: lastSeen,
+				IsOnline: isOnline,
+			}
+		}
+		log.Printf("从Redis加载了 %d 个用户", len(users))
 	}
 }
+
+
 
 // broadcast 广播消息给所有客户端
 func (cs *ChatServer) broadcast(message Message) {
@@ -49,6 +134,20 @@ func (cs *ChatServer) broadcast(message Message) {
 
 	// 添加到消息历史
 	cs.messages = append(cs.messages, message)
+
+	// 保存到Redis（异步操作，不阻塞广播）
+	go func() {
+		msgMap := map[string]interface{}{
+			"sender":    message.Sender,
+			"content":   message.Content,
+			"type":      message.Type,
+			"timestamp": message.Timestamp.Format(time.RFC3339),
+		}
+		
+		if err := cs.redisStore.SaveMessage(msgMap); err != nil {
+			log.Printf("Redis保存消息失败: %v", err)
+		}
+	}()
 
 	// 广播给所有连接的客户端
 	for client := range cs.clients {
@@ -76,18 +175,44 @@ func (cs *ChatServer) JoinHandler(w http.ResponseWriter, r *http.Request) {
 	cs.mutex.Lock()
 	defer cs.mutex.Unlock()
 
-	// 检查用户名是否已存在
-	if _, exists := cs.users[username]; exists {
-		// http.Error(w, "用户名已存在", http.StatusConflict)
-		// return
+	// // 检查用户名是否已存在
+	// if _, exists := cs.users[username]; exists {
+	// 	// http.Error(w, "用户名已存在", http.StatusConflict)
+	// 	// return
+	// }
+
+	// // 添加新用户
+	// cs.users[username] = &User{
+	// 	Name:     username,
+	// 	LastSeen: time.Now(),
+	// 	IsOnline: true,
+	// }
+
+	// 检查用户是否已存在，如果存在则更新状态
+	if existingUser, exists := cs.users[username]; exists {
+		existingUser.IsOnline = true
+		existingUser.LastSeen = time.Now()
+	} else {
+		// 添加新用户
+		cs.users[username] = &User{
+			Name:     username,
+			LastSeen: time.Now(),
+			IsOnline: true,
+		}
 	}
 
-	// 添加新用户
-	cs.users[username] = &User{
-		Name:     username,
-		LastSeen: time.Now(),
-		IsOnline: true,
-	}
+	// 保存用户状态到Redis
+	go func() {
+		userMap := map[string]interface{}{
+			"username": username,
+			"last_seen": time.Now().Format(time.RFC3339),
+			"is_online": true,
+		}
+		
+		if err := cs.redisStore.SaveUser(userMap); err != nil {
+			log.Printf("Redis保存用户失败: %v", err)
+		}
+	}()
 
 	// 广播用户加入消息
 	joinMsg := Message{
@@ -97,6 +222,17 @@ func (cs *ChatServer) JoinHandler(w http.ResponseWriter, r *http.Request) {
 		Type:      "join",
 	}
 	go cs.broadcast(joinMsg)
+
+	// // 广播用户加入消息（只有新用户才广播）
+	// if _, exists := cs.users[username]; !exists {
+	// 	joinMsg := Message{
+	// 		Sender:    "系统",
+	// 		Content:   fmt.Sprintf("用户 %s 加入了聊天室", username),
+	// 		Timestamp: time.Now(),
+	// 		Type:      "join",
+	// 	}
+	// 	go cs.broadcast(joinMsg)
+	// }
 
 	log.Printf("用户 %s 加入了聊天室", username)
 	
@@ -128,6 +264,24 @@ func (cs *ChatServer) LeaveHandler(w http.ResponseWriter, r *http.Request) {
 	if user, exists := cs.users[username]; exists {
 		user.IsOnline = false
 		user.LastSeen = time.Now()
+
+		// 更新Redis中的用户状态
+		go func() {
+			if err := cs.redisStore.UpdateUserOnlineStatus(username, false); err != nil {
+				log.Printf("Redis更新用户状态失败: %v", err)
+			}
+		}()
+
+		// // 广播用户离开消息
+		// leaveMsg := Message{
+		// 	Sender:    "系统",
+		// 	Content:   fmt.Sprintf("用户 %s 离开了聊天室", username),
+		// 	Timestamp: time.Now(),
+		// 	Type:      "leave",
+		// }
+		// go cs.broadcast(leaveMsg)
+
+		// log.Printf("用户 %s 离开了聊天室", username)
 	}
 
 	// 广播用户离开消息
@@ -147,6 +301,25 @@ func (cs *ChatServer) LeaveHandler(w http.ResponseWriter, r *http.Request) {
 		"message": "离开成功",
 	})
 }
+
+// autoBackup 自动备份（可选）
+func (cs *ChatServer) autoBackup() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	
+	for range ticker.C {
+		log.Println("执行自动数据检查...")
+		// 这里可以添加定期数据一致性检查等
+	}
+}
+
+// Close 关闭服务器时清理资源
+func (cs *ChatServer) Close() {
+	if cs.redisStore != nil {
+		cs.redisStore.Close()
+	}
+}
+
 
 // SendHandler 处理发送消息
 func (cs *ChatServer) SendHandler(w http.ResponseWriter, r *http.Request) {
